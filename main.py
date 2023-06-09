@@ -45,8 +45,32 @@ def main() -> None:
     ebx_val = win_driver.fetch_state().ebx
     wibo_driver = WiboDriver(COMMAND, START_ADDRESS, cwd="/home/conor/projects/wibo", env={"WIBO_EBX_OVERRIDE": str(ebx_val)})
 
+    SYSCALL_BREAKPOINTS = [
+        #0x411fd0, # GetCurrentThreadId
+        #0x411ffa, # GetStdHandle
+        0x412006, # VirtualAlloc
+        0x41207e, # CreateFileA
+        0x41204e, # SetFilePointer
+        #0x412030, # GetTickCount
+        #0x411ff4, # GetFileType
+        #0x412072, # GetEnvironmentStrings
+        #0x41206c, # GetModuleFileNameA
+        #0x412066, # GetCommandLineA
+        #0x4120a2, # GetCurrentDirectoryA
+        0x412042, # ReadFile
+        #0x41205a, # GetModuleHandleA
+        0x41203c, # WriteFile
+    ]
+
+    for b in SYSCALL_BREAKPOINTS:
+        win_driver.run_command(f"bu {b:#x}")
+        wibo_driver.run_command(f"b *{b:#x}")
+
     while True:
+        win_driver.run_command("g")
         win_state = win_driver.step()
+
+        wibo_driver.run_command("c")
         wibo_state = wibo_driver.step()
 
         print (f"{win_state.eip:#10x}")
@@ -59,7 +83,8 @@ def main() -> None:
         # Possibility one: we're about to make a kernel call,
         # and eip is different as we've begun executing code
         # from some system dll (or wibo's implementation thereof)
-        if win_state == dataclasses.replace(wibo_state, eip=win_state.eip):
+        #if win_state == dataclasses.replace(wibo_state, eip=win_state.eip):
+        if True: # This is a syscall, now.
             syscall_name = wibo_driver.get_current_function_name()
             cprint (f"SYSTEM CALL DETECTED: {syscall_name}", "red")
 
@@ -81,7 +106,15 @@ def main() -> None:
             else:
                 win_state = win_driver.step_out()
             
-            if syscall_name in ["kernel32::GetCurrentThreadId()", "kernel32::GetStdHandle(unsigned", "kernel32::VirtualAlloc(void*,", "kernel32::CreateFileA(char", "kernel32::SetFilePointer(void*,"]:
+            UNSIGNED_INT_SYSCALLS = [
+                "kernel32::GetCurrentThreadId()",
+                "kernel32::GetStdHandle(unsigned",
+                #"kernel32::VirtualAlloc(void*,",
+                "kernel32::CreateFileA(char",
+                "kernel32::SetFilePointer(void*,"
+            ]
+
+            if syscall_name in UNSIGNED_INT_SYSCALLS:
                 send_on_wibo_socket(struct.pack("I", win_state.eax)) # unsigned int
 
             if syscall_name in ["kernel32::GetTickCount()"]:
@@ -167,10 +200,10 @@ def main() -> None:
 
             cprint (f"{field_name}\t\t{win_val:#010x}\t\t{wibo_val:#010x}", "white" if win_val == wibo_val else "red")
 
-        break
+        #break
 
-    win_driver.run_to_completion()
-    wibo_driver.run_to_completion()
+    #win_driver.run_to_completion()
+    #wibo_driver.run_to_completion()
 
     check_output_discrepency_present()  
 
