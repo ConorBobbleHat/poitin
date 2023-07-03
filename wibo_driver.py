@@ -48,6 +48,9 @@ class WiboDriver(Driver):
     def get_current_function_name(self) -> str:
         return self.run_command("info symbol $eip").split()[0]
 
+    def read_half_word(self, address: int) -> int:
+        raise NotImplementedError("read_half_word not implemented for WiboDriver!")
+
     def read_word(self, address: int) -> int:
         raise NotImplementedError("read_word not implemented for WiboDriver!")
 

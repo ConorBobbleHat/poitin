@@ -41,6 +41,11 @@ class WinDriver(Driver):
     def get_current_function_name(self) -> str:
         raise NotImplementedError("get_current_function_name is not implemented for WinDriver!")
 
+    def read_half_word(self, address: int) -> int:
+        raw_output = self.run_command(f"dw /c1 {address:#x} {address:#x}")
+        parts = raw_output.split()
+        return int(parts[1], 16) # skip address, return value, skip ascii
+
     def read_word(self, address: int) -> int:
         raw_output = self.run_command(f"dc /c1 {address:#x} {address:#x}")
         parts = raw_output.split()

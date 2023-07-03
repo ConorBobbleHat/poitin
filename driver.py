@@ -82,6 +82,10 @@ class Driver(ABC):
         pass
 
     @abstractmethod
+    def read_half_word(self, address: int) -> int:
+        pass
+
+    @abstractmethod
     def read_word(self, address: int) -> int:
         pass
 
