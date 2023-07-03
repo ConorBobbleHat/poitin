@@ -1,8 +1,6 @@
 from termcolor import cprint
 
 import dataclasses
-import os
-import subprocess
 import socket
 import struct
 
