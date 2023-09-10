@@ -1,15 +1,19 @@
 from driver import Driver, ExecutionState
 
-from typing import Dict, List
+import subprocess
+
+from typing import Dict, List, Optional
 
 
 class WiboDriver(Driver):
-    def __init__(self, command: List[str], start_address: int, cwd: str=".", env: Dict[str, str]={}) -> None:
+    def __init__(self, command: List[str], cwd: str=".", env: Dict[str, str]={}) -> None:
         # In order to ferry through environmental variables to WSL,
         # we need to inject them into the command string
         command_env_part = [f"{key}={val}" for (key, val) in env.items()]
 
-        super().__init__(["wsl", "--cd", cwd] + command_env_part + ["gdb", "--args", "./build/wibo"] + command, start_address, cwd, env)
+        subprocess.run("wsl killall gdb")
+
+        super().__init__(["wsl", "--cd", cwd] + command_env_part + ["gdb", "--args", "./build/wibo"] + command, cwd, env)
         self.prompt = "(gdb)"
 
         self.read_until_prompt() # discard welcome text
@@ -17,10 +21,8 @@ class WiboDriver(Driver):
         # With wibo, we presume we're running a special augmented version
         # that has a breakpoint right before the jump to windows code
         # TODO: verify here we're actually at the start address!
-        self.run_command(f"r")
+        self.run_command("r")
         self.run_command("si")
-        self.run_command(f"b *{start_address:#x}")
-        self.run_command("c")
 
 
     def step(self) -> ExecutionState:
@@ -28,7 +30,7 @@ class WiboDriver(Driver):
         return self.fetch_state()
 
     def step_out(self) -> ExecutionState:
-        print (self.run_command("fin"))
+        self.run_command("fin")
         return self.fetch_state()
 
     def fetch_state(self) -> ExecutionState:
@@ -45,8 +47,24 @@ class WiboDriver(Driver):
 
         return ExecutionState(**reg_dict)
     
-    def get_current_function_name(self) -> str:
-        return self.run_command("info symbol $eip").split()[0]
+    def get_function_name(self, address: int) -> Optional[str]:
+        function_name = self.run_command(f"info symbol {address:#x}").split()[0].split("(")[0]
+        if function_name == "No":
+            return None
+        return function_name
+
+    def get_current_function_name(self) -> Optional[str]:
+        function_name = self.run_command("info symbol $eip").split()[0].split("(")[0]
+        if function_name == "No":
+            return None
+        return function_name
+    
+    def read_byte(self, address: int) -> Optional[int]:
+        out = self.run_command(f"x/1xb {address:#x}")
+        try:
+            return int(out.splitlines()[0].split(":")[1], 16)
+        except ValueError:
+            return None
 
     def read_half_word(self, address: int) -> int:
         raise NotImplementedError("read_half_word not implemented for WiboDriver!")
@@ -57,5 +75,5 @@ class WiboDriver(Driver):
     def read_string_at_address(self, address: int) -> str:
         raise NotImplementedError("read_string_at_address not implemented for WiboDriver!")
 
-    def run_to_completion(self) -> None:
+    def continue_execution(self) -> None:
         self.run_command("c")

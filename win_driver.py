@@ -2,19 +2,19 @@ import re
 
 from driver import Driver, ExecutionState
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 CDB_LOCATION = "C:\\Program Files (x86)\\Windows Kits\\10\\Debuggers\\x86\\cdb.exe"
 
 class WinDriver(Driver):
-    def __init__(self, command: List[str], start_address: int, cwd: str=".", env: Dict[str, str]={}) -> None:
-        super().__init__([CDB_LOCATION] + command, start_address, cwd, env)
+    def __init__(self, command: List[str], cwd: str=".", env: Dict[str, str]={}) -> None:
+        super().__init__([CDB_LOCATION] + command, cwd, env)
         self.prompt = "0:000>"
 
         self.read_until_prompt() # discard welcome text
 
-        self.run_command(f"bu {start_address:#x}")
+        self.run_command(f"bu $exentry")
         self.run_command(f"g")
 
 
@@ -38,22 +38,34 @@ class WinDriver(Driver):
         
         return ExecutionState(**reg_dict)
     
+    def get_function_name(self, address: int) -> str:
+        x = self.run_command(f"ln {address:#x}")
+        return x.split("|")[0].split()[1]
+
     def get_current_function_name(self) -> str:
         raise NotImplementedError("get_current_function_name is not implemented for WinDriver!")
 
-    def read_half_word(self, address: int) -> int:
+    def read_byte(self, address: int) -> Optional[int]:
+        raw_output = self.run_command(f"db /c1 {address:#x} {address:#x}")
+        parts = raw_output.split()
+        if "??" in parts[1]:
+            return None
+        
+        return int(parts[1], 16) # skip address, return value, skip ascii
+
+    def read_half_word(self, address: int) -> Optional[int]:
         raw_output = self.run_command(f"dw /c1 {address:#x} {address:#x}")
         parts = raw_output.split()
         return int(parts[1], 16) # skip address, return value, skip ascii
 
-    def read_word(self, address: int) -> int:
+    def read_word(self, address: int) -> Optional[int]:
         raw_output = self.run_command(f"dc /c1 {address:#x} {address:#x}")
         parts = raw_output.split()
         return int(parts[1], 16) # skip address, return value, skip ascii
 
-    def read_string_at_address(self, address: int) -> str:
+    def read_string_at_address(self, address: int) -> Optional[str]:
         raw_output = self.run_command(f'.printf "%ma", {address:#x}')
         return raw_output.split("0:000>")[0].strip()
 
-    def run_to_completion(self) -> None:
+    def continue_execution(self) -> None:
         self.run_command("g")

@@ -1,14 +1,18 @@
 from termcolor import cprint
+import pefile # type: ignore
 
 import dataclasses
 import socket
 import struct
+import configparser
+import shlex
 
 from win_driver import WinDriver
 from wibo_driver import WiboDriver
 
-COMMAND = ["armcc/5.04/b82/armcc.exe", "armcc/test.c"]
-START_ADDRESS = 0x0c8df39
+_CONFIG = configparser.ConfigParser()
+_CONFIG.read(["config.ini", "config.local.ini"])
+CONFIG = _CONFIG["poitin"]
 
 def setup_output_discrepency_check() -> None:
     return
@@ -16,21 +20,57 @@ def setup_output_discrepency_check() -> None:
 def check_output_discrepency_present() -> None:
     return
 
-def send_on_wibo_socket(data: bytes) -> None:
-    wibo_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
-    wibo_socket.sendto(data, ("172.25.101.16", 8088))
-
 def main() -> None:
     setup_output_discrepency_check()
     
-    win_driver = WinDriver(COMMAND, START_ADDRESS)
+    COMMAND = shlex.split(CONFIG.get("Command"))
+    CYCLE_ACCURATE = CONFIG.getboolean("CycleAccurate")
+    CYCLE_ACCURATE_TRIGGER = CONFIG.get("CycleAccurateTrigger")
+
+    win_driver = WinDriver(COMMAND)
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server_socket.bind(("0.0.0.0", 8088))
+
+    win_state = win_driver.fetch_state()
+    wibo_driver = WiboDriver(COMMAND, cwd="/home/conor/projects/wibo", env={
+        "POITIN_STACK_BASE": str(win_state.ebp)
+    })
+
+    # 32-bit windows isn't amazingly strict on the starting value
+    # of registers when execution is handed over to a newly created process.
+    # As such: there's a bunch of unimportant registers we need to copy over from windows to wibo to ensure
+    # cycle-level matching in execution. (Most will be immediately discarded, anyways)
+    # We're safe to do things like override the stack registers - wibo will have mapped the stack for us
+    wibo_driver.set_state(win_state)
     
-    ebx_val = win_driver.fetch_state().ebx
-    wibo_driver = WiboDriver(COMMAND, START_ADDRESS, cwd="/home/conor/projects/wibo", env={"WIBO_EBX_OVERRIDE": str(ebx_val)})
+    if not CYCLE_ACCURATE:
+        # Set up breakpoints at syscalls.
+        pe = pefile.PE(COMMAND[0])
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            dll: str = entry.dll.decode("utf8")
+            module_name = dll.split(".")[0].lower()
+
+            for imp in entry.imports:
+                fun_name: str = imp.name.decode("utf8")
+                
+                out = win_driver.run_command(f"bu {module_name}!{fun_name}")
+
+                if "Couldn't resolve" in out:
+                    win_driver.run_command(f"bu {module_name}!{fun_name}Stub")
+
+                wibo_driver.run_command(f"b {module_name}::{fun_name}")
 
     while True:
-        win_state = win_driver.step()
-        wibo_state = wibo_driver.step()
+        if CYCLE_ACCURATE:
+            win_state = win_driver.step()
+            wibo_state = wibo_driver.step() 
+        else:
+            win_driver.continue_execution()
+            win_state = win_driver.fetch_state()
+
+            wibo_driver.continue_execution()
+            wibo_state = wibo_driver.fetch_state()
 
         print (f"{win_state.eip:#10x}")
 
@@ -42,138 +82,110 @@ def main() -> None:
         # Possibility one: we're about to make a kernel call,
         # and eip is different as we've begun executing code
         # from some system dll (or wibo's implementation thereof)
-        if win_state == dataclasses.replace(wibo_state, eip=win_state.eip):
+        if win_state.eip != wibo_state.eip:
             syscall_name = wibo_driver.get_current_function_name()
+            return_address = win_driver.read_word(win_state.esp)
+
+            if syscall_name == CYCLE_ACCURATE_TRIGGER:
+                cprint ("Switching to cycle accurate mode!", "red")
+                CYCLE_ACCURATE = True
+
             cprint (f"SYSTEM CALL DETECTED: {syscall_name}", "red")
             cprint (f"({win_state.eip:#x} vs {wibo_state.eip:#x})", "yellow")
 
-            if syscall_name in ["kernel32::GetCurrentProcessId()", "kernel32::GetTickCount()"]:
-                # For whatever reason, stepping out of these syscalls is broken.
-                # Not sure why!
-                ret = win_driver.read_word(win_state.esp)
+            wibo_driver.continue_execution()
 
-                win_driver.run_command(f"bu {ret:#x}")
-                win_driver.run_command("g")
-                win_state = win_driver.fetch_state()
-            else:
-                win_state = win_driver.step_out()
-            
-            UNSIGNED_INT_SYSCALLS = [
-                "kernel32::GetCurrentThreadId()",
-                "kernel32::GetStdHandle(unsigned",
-                "kernel32::VirtualAlloc(void*,",
-                "kernel32::CreateFileA(char",
-                "kernel32::SetFilePointer(void*,",
-                "kernel32::GetCurrentProcessId()",
-                "kernel32::HeapCreate(unsigned",
-                "kernel32::GetModuleHandleW(unsigned"
-            ]
+            # This is where the meat and potatoes of poitin begins
+            # Respond to requests from our wibo guest for information about
+            # the windows program running in tandem to it
+            while True:
+                data, client = server_socket.recvfrom(1024)
+                if len(data) != data[0]:
+                    print ("Corrupt packet!")
+                    import sys; sys.exit(1)
 
-            if syscall_name in UNSIGNED_INT_SYSCALLS:
-                send_on_wibo_socket(struct.pack("I", win_state.eax)) # unsigned int
+                opcode = data[1]
 
-            if syscall_name in ["kernel32::GetTickCount()"]:
-                send_on_wibo_socket(struct.pack("i", win_state.eax)) # int
+                if opcode == 0:
+                    # Windows step out
+                    win_driver.run_command(f"bu {return_address:#x}")
+                    win_driver.run_command("g")
+                    win_state = win_driver.fetch_state()
+                elif opcode == 1:
+                    # Request fetch register
+                    reg_index = data[2]
+                    reg_name = wibo_driver.EXECUTION_STATE_FIELDS[reg_index]
+                    reg_value = getattr(win_state, reg_name)
 
-            if syscall_name in ["kernel32::GetFileType(void*)"]:
-                send_on_wibo_socket(struct.pack("H", win_state.eax)) # unsigned short
-
-            if syscall_name == "kernel32::GetEnvironmentStrings()":
-                # Grab the environment string
-                # Windows makes things complicated.
-                # We can only read a single null-terminated string at a time
-                # but the environment variables are a list of null terminated strings
-                # that we don't know the length of
-                pointer = win_state.eax
-                environment_variables = []
-
-                while True:
-                    environment_variable = win_driver.read_string_at_address(pointer)
-
-                    if len(environment_variable) == 0:
-                        break
+                    server_socket.sendto(struct.pack("I", reg_value), client)
+                elif opcode == 2:
+                    # Hand back execution to wibo
+                    break
+                elif opcode == 3:
+                    # memcpy
+                    addr = struct.unpack("I", data[4:8])[0]
+                    l = struct.unpack("I", data[8:12])[0]
                     
-                    pointer += len(environment_variable) + 1
-                    environment_variables.append(environment_variable)
+                    d = b""
+                    for i in range(l):
+                        b = win_driver.read_byte(addr + i)
+                        if b is None:
+                            raise ValueError(f"Attempted to read invalid memory from windows: {addr + i:#x}")
+                        
+                        d += bytearray([b])
 
-                env_string = b"\x00".join([i.encode() for i in environment_variables]) + b"\x00\x00"
+                    server_socket.sendto(d, client)
+                elif opcode == 4:
+                    # strlen
+                    addr = struct.unpack("I", data[4:8])[0]
+                    s = win_driver.read_string_at_address(addr)
+                    if s is None:
+                        raise ValueError(f"Attempted to read invalid string from windows at {addr:#x}")
 
-                send_on_wibo_socket(struct.pack("I", win_state.eax))
-                send_on_wibo_socket(struct.pack("I", len(env_string)))
-                send_on_wibo_socket(env_string)
-                
-            if syscall_name == "kernel32::GetModuleFileNameA(void*,":
-                module_file_name = win_driver.read_string_at_address(win_state.esp + 0)
-                send_on_wibo_socket(struct.pack("I", len(module_file_name) + 1))
-                send_on_wibo_socket(module_file_name.encode() + b"\x00")
+                    l = len(s)
+                    server_socket.sendto(struct.pack("I", l), client)
+                elif opcode == 5:
+                    # strlenWide
+                    addr = struct.unpack("I", data[4:8])[0]
+                    l = 0
 
-            if syscall_name == "kernel32::GetCommandLineA()":
-                command_line = win_driver.read_string_at_address(win_state.eax)
-                send_on_wibo_socket(struct.pack("I", win_state.eax))
-                send_on_wibo_socket(struct.pack("I", len(command_line) + 1))
-                send_on_wibo_socket(command_line.encode() + b"\x00")
+                    while win_driver.read_half_word(addr) != 0:
+                        l += 1
+                        addr += 2
 
-            if syscall_name == "kernel32::GetCurrentDirectoryA(unsigned":
-                current_directory = win_driver.read_string_at_address(win_state.esp + 0)
-                send_on_wibo_socket(struct.pack("I", len(current_directory) + 1))
-                send_on_wibo_socket(current_directory.encode() + b"\x00")
+                    server_socket.sendto(struct.pack("I", l), client)
+                elif opcode == 6:
+                    # check address mapped
+                    addr = struct.unpack("I", data[4:8])[0]
+                    executor = struct.unpack("I", data[8:12])[0]
 
-            if syscall_name == "kernel32::ReadFile(void*,":
-                # TODO: this is blatantly tailered towards one file in particular
-                # It breaks on whitespace.
-                # It breaks on unicode.
-                # Everything about this is bad.
-                print ("YOU SHOULD FIX READFILE")
-                import sys; sys.exit(1)
+                    ret = (win_driver if executor == 0 else wibo_driver).read_byte(addr)
+                    server_socket.sendto(struct.pack("I", 0 if ret is None else 1), client)
+                elif opcode == 7:
+                    # dynamic pointer substitution
+                    addr = struct.unpack("I", data[4:8])[0]
+                    windows_function_name = win_driver.get_function_name(addr)
+                    wibo_function_name = windows_function_name.replace("!", "::")
+                    if wibo_function_name.endswith("Stub"):
+                        wibo_function_name = wibo_function_name.split("Stub")[0]
 
-                file_contents = win_driver.read_string_at_address(win_driver.read_word(win_state.esp + 0x14))
-                if len(file_contents.strip()) == 0:
-                    send_on_wibo_socket(struct.pack("I", 0))
-                else:    
-                    file_contents = "\t" + file_contents + "\r\n"
-                    send_on_wibo_socket(struct.pack("I", len(file_contents)))
-                    send_on_wibo_socket(file_contents.encode())
+                    wibo_function_name = wibo_function_name.replace("KERNEL32", "kernel32")
 
-            if syscall_name == "kernel32::GetSystemTimeAsFileTime(kernel32::FILETIME*)":
-                filetime_low = win_driver.read_word(win_state.ecx)
-                filetime_high = win_driver.read_word(win_state.ecx + 4)
-                filetime = filetime_low + (filetime_high << 32)
-                send_on_wibo_socket(struct.pack("Q", filetime))
+                    out = wibo_driver.run_command(f"info address {wibo_function_name}")
+                    if out.strip() == "(gdb)":
+                        raise ValueError("Dynamic pointer substitution requested for unimplemented function!")
 
-                # Void function - EAX is a scratch register.
-                # Copy it over.
-                wibo_state = dataclasses.replace(wibo_state, eax=win_state.eax)
-                wibo_driver.set_state(wibo_state)
+                    wibo_addr = int(out.splitlines()[0].strip()[:-1].split()[-1], 16)
+                    server_socket.sendto(struct.pack("I", wibo_addr), client)
+                else:
+                    raise ValueError(f"Unknown opcode: {opcode}")
 
-            if syscall_name == "kernel32::QueryPerformanceCounter(unsigned":
-                # TODO: reading from ECX like this is brittle - a windows update
-                # could change where this value appears.
-                # We should grab this *before* executing QueryPerformanceCounter
-                filetime_low = win_driver.read_word(win_state.ecx)
-                filetime_high = win_driver.read_word(win_state.ecx + 4)
-                filetime = filetime_low + (filetime_high << 32)
-                send_on_wibo_socket(struct.pack("Q", filetime))
+                wibo_driver.continue_execution()
 
-                send_on_wibo_socket(struct.pack("I", win_state.eax)) # unsigned int
+            wibo_driver.run_command(f"b *{return_address:#x}")
+            wibo_driver.run_command("c")
+            wibo_state = wibo_driver.fetch_state()
 
-            """if syscall_name == "kernel32::GetModuleHandleW(unsigned":
-                module_name_ptr = win_driver.read_word(win_state.esp - 0x4)
-                module_name = b""
-
-                while (read_half_word := win_driver.read_half_word(module_name_ptr)) != 0:
-                    module_name += struct.pack("H", read_half_word)
-                    module_name_ptr += 2
-
-                module_name += b"\x00\x00" # terminating null byte
-
-                send_on_wibo_socket(struct.pack("I", len(module_name)))
-                send_on_wibo_socket(module_name)"""
-            
-
-
-
-            wibo_state = wibo_driver.step_out()
-            
             # The stdcall calling convention designates EAX, ECX, and EDX for use
             # inside a callee function.
             # EAX is the return value - we don't want to mess with that.
@@ -183,7 +195,7 @@ def main() -> None:
             # discrepencies.
             wibo_state = dataclasses.replace(wibo_state, ecx=win_state.ecx, edx=win_state.edx)
 
-            if syscall_name in ["kernel32::GetSystemTimeAsFileTime(kernel32::FILETIME*)"]:
+            if syscall_name in ["kernel32::GetSystemTimeAsFileTime"]:
                 # The only exception to the above are void functions.
                 # There, EAX is a scratch register too.
                 wibo_state = dataclasses.replace(wibo_state, eax=win_state.eax)
@@ -193,7 +205,23 @@ def main() -> None:
             if win_state == wibo_state:
                 continue
 
-        # Possibility two: it's a bonafide difference!
+        # Possibility two: our executable's loaded an address of a kernel32 function.
+        # For this to be the case: there can only be a single register different between the two
+        field_discrepencies = { i : getattr(win_state, i) != getattr(wibo_state, i) for i in win_driver.EXECUTION_STATE_FIELDS }
+        all_kernel32_addresses = True
+        
+        for (field, is_discrepant) in field_discrepencies.items():
+            if not is_discrepant:
+                continue
+
+            function_name = wibo_driver.get_function_name(getattr(wibo_state, field))
+            if not function_name:
+                all_kernel32_addresses = False
+
+        if all_kernel32_addresses:
+            continue
+
+        # Possibility three: it's a bonafide difference!
         print ("============== DISCREPANCY DETECTED ==============")
         print ("Register\tWindows\t\t\tWibo")
         for field_name in win_driver.EXECUTION_STATE_FIELDS:
@@ -204,8 +232,8 @@ def main() -> None:
 
         break
 
-    win_driver.run_to_completion()
-    wibo_driver.run_to_completion()
+    win_driver.continue_execution()
+    wibo_driver.continue_execution()
 
     check_output_discrepency_present()  
 

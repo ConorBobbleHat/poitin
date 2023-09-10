@@ -20,9 +20,8 @@ class ExecutionState:
 
 
 class Driver(ABC):
-    def __init__(self, command: List[str], start_address: int, cwd: str=".", env: Dict[str, str]={}) -> None:
+    def __init__(self, command: List[str], cwd: str=".", env: Dict[str, str]={}) -> None:
         self.command = command
-        self.start_address = start_address
         self.cwd = cwd
         self.prompt = ""
         self.env = env
@@ -78,21 +77,29 @@ class Driver(ABC):
         pass
 
     @abstractmethod
-    def get_current_function_name(self) -> str:
+    def get_function_name(self, address: int) -> Optional[str]:
+        pass 
+
+    @abstractmethod
+    def get_current_function_name(self) -> Optional[str]:
         pass
 
     @abstractmethod
-    def read_half_word(self, address: int) -> int:
+    def read_byte(self, address: int) -> Optional[int]:
         pass
 
     @abstractmethod
-    def read_word(self, address: int) -> int:
+    def read_half_word(self, address: int) -> Optional[int]:
         pass
 
     @abstractmethod
-    def read_string_at_address(self, address: int) -> str:
+    def read_word(self, address: int) -> Optional[int]:
         pass
 
     @abstractmethod
-    def run_to_completion(self) -> None:
+    def read_string_at_address(self, address: int) -> Optional[str]:
+        pass
+
+    @abstractmethod
+    def continue_execution(self) -> None:
         pass

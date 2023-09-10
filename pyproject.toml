@@ -9,6 +9,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = "^3.10"
 termcolor = "^2.3.0"
+pefile = "^2023.2.7"
 
 
 [build-system]
